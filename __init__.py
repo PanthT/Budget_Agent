@@ -1,0 +1,1 @@
+"""Budget Agent — turns expense PDFs or CSVs into a personalized budget plan."""
