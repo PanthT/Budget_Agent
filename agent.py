@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import json
 import argparse
-import shlex
+import re
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 if __package__:
@@ -19,27 +20,31 @@ from langchain_core.tools import tool
 
 
 @tool("budget_report", description=(
-    "Calculate the total expenses and number of expense transactions from an "
-    "already-parsed JSON list. Amounts are negative for expenses. This tool "
-    "does not read or parse source documents."
+    "Calculate the exact total expenses and count of expense transactions "
+    "from a list of transaction objects. Pass the transaction list directly "
+    "as the transactions argument, not as a JSON-encoded string. Amounts are "
+    "negative for expenses. This tool does not read source documents."
 ))
-def budget_report(transactions_json: str) -> str:
-    try:
-        transactions = json.loads(transactions_json)
-    except json.JSONDecodeError as exc:
-        return f"Could not parse transactions JSON: {exc}"
-
-    if isinstance(transactions, dict):
-        transactions = transactions.get("transactions", [])
-
-    total = sum(float(t.get("amount", 0)) for t in transactions if float(t.get("amount", 0)) < 0)
-    count = len([t for t in transactions if float(t.get("amount", 0)) < 0])
+def budget_report(transactions: list[dict]) -> str:
+    total = Decimal("0")
+    count = 0
+    for index, transaction in enumerate(transactions):
+        try:
+            amount = Decimal(str(transaction["amount"]))
+        except (KeyError, InvalidOperation, TypeError) as exc:
+            raise ValueError(
+                f"Transaction {index + 1} has a missing or invalid amount."
+            ) from exc
+        if not amount.is_finite():
+            raise ValueError(f"Transaction {index + 1} has a non-finite amount.")
+        if amount < 0:
+            total += abs(amount)
+            count += 1
 
     return json.dumps({
-        "total_expenses": round(abs(total), 2),
+        "total_expenses": str(total.quantize(Decimal("0.01"))),
         "transaction_count": count,
-        "note": "LLM will categorize spending and give the budget plan.",
-        "transactions": transactions,
+        "note": "Use these calculated values exactly; do not recalculate them.",
     }, indent=2)
 
 
@@ -54,17 +59,19 @@ def build_agent():
             "contains transactions already extracted deterministically from "
             "the source document; never try to read or re-parse a file.\n\n"
             "Workflow:\n"
-            "1. Use budget_report to calculate the total expenses and "
-            "transaction count from the provided transactions JSON.\n"
-            "2. Group the transactions into clear spending categories such as "
+            "1. Call budget_report with the transactions list directly and "
+            "use its returned total and count exactly; do not recalculate them.\n"
+            "2. Categorize only negative-amount transactions as spending. "
+            "Positive amounts are inflows and must not be presented as expenses.\n"
+            "3. Group expenses into clear spending categories such as "
             "Groceries, Dining, Transport, Housing, Utilities, Entertainment, "
             "Shopping, Health, and Other. Sum each category.\n"
-            "3. Give a concise summary of total spending and the top "
+            "4. Give a concise summary of total spending and the top "
             "categories.\n"
-            "4. Then give a personalized budget recommendation: suggest "
-            "reasonable monthly limits per category, flag the largest "
-            "unnecessary expenses, and list 3-5 actionable ways the user can "
-            "save money.\n"
+            "5. Offer practical saving suggestions, but do not assume a "
+            "monthly budget or make unsupported savings estimates unless the "
+            "transaction period is clear. Do not label purchases necessary or "
+            "unnecessary based only on merchant names.\n"
             "Be friendly, specific, and use actual numbers from the data."
         ),
         debug=False,
@@ -115,40 +122,51 @@ def _transaction_context(file_path: str | Path, transactions: list[dict]) -> str
     )
 
 
+def _document_path_in_message(message: str) -> Path | None:
+    match = re.search(
+        r"""(?:"([^"\n]+\.(?:pdf|csv))"|'([^'\n]+\.(?:pdf|csv))'|([^\s"'<>]+\.(?:pdf|csv)))""",
+        message,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    return Path(next(group for group in match.groups() if group is not None)).expanduser()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Chat with the local budgeting agent; optionally load a PDF or CSV."
+        description="Chat with the local budgeting agent using terminal input."
     )
     parser.add_argument(
         "file",
         nargs="?",
-        help="Optional statement path (.pdf or .csv) to load at startup.",
+        help="Optional PDF or CSV statement path to analyze at startup.",
     )
     args = parser.parse_args()
 
     agent = build_agent()
     messages: list[dict] = []
 
-    def load_file(file_path: str) -> None:
+    def ask_agent(user_text: str, file_path: str | None = None) -> None:
         nonlocal messages
-        transactions = load_transactions(file_path)
-        messages = [{
-            "role": "user",
-            "content": _transaction_context(file_path, transactions),
-        }]
+        if file_path is not None:
+            transactions = load_transactions(file_path)
+            user_text = f"{user_text}\n\n{_transaction_context(file_path, transactions)}"
+        messages.append({"role": "user", "content": user_text})
         result = agent.invoke({"messages": messages})
         messages = result["messages"]
-        last = messages[-1]
-        print(getattr(last, "content", last))
-        print(f"\nLoaded {len(transactions)} transactions from {Path(file_path).name}.")
+        print(getattr(messages[-1], "content", messages[-1]))
 
     if args.file:
         try:
-            load_file(args.file)
+            ask_agent("Please analyze this statement and summarize my spending.", args.file)
         except (OSError, ValueError) as exc:
             parser.error(str(exc))
 
-    print("Budget agent ready. Use /load <path.pdf|path.csv>, /help, or /quit.")
+    print(
+        "Budget agent ready. Chat normally; include a PDF or CSV path in your "
+        "message to analyze it. Press Ctrl-D or Ctrl-C to exit."
+    )
     while True:
         try:
             user_text = input("You: ").strip()
@@ -158,26 +176,11 @@ def main() -> None:
 
         if not user_text:
             continue
-        if user_text == "/quit":
-            break
-        if user_text == "/help":
-            print("Commands: /load <path.pdf|path.csv>, /help, /quit")
-            continue
-        if user_text.startswith("/load"):
-            try:
-                command = shlex.split(user_text)
-                if len(command) != 2:
-                    raise ValueError("Usage: /load <path.pdf|path.csv>")
-                load_file(command[1])
-            except (OSError, ValueError) as exc:
-                print(f"Could not load statement: {exc}")
-            continue
-
-        messages.append({"role": "user", "content": user_text})
-        result = agent.invoke({"messages": messages})
-        messages = result["messages"]
-        last = messages[-1]
-        print(f"Agent: {getattr(last, 'content', last)}")
+        file_path = _document_path_in_message(user_text)
+        try:
+            ask_agent(user_text, str(file_path) if file_path else None)
+        except (OSError, ValueError) as exc:
+            print(f"Could not analyze the statement: {exc}")
 
 
 if __name__ == "__main__":
